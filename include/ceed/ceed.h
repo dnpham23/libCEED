@@ -469,6 +469,8 @@ CEED_EXTERN int  CeedOperatorCheckReady(CeedOperator op);
 CEED_EXTERN int  CeedOperatorGetActiveVectorLengths(CeedOperator op, CeedSize *input_size, CeedSize *output_size);
 CEED_EXTERN int  CeedOperatorSetQFunctionAssemblyReuse(CeedOperator op, bool reuse_assembly_data);
 CEED_EXTERN int  CeedOperatorSetQFunctionAssemblyDataUpdateNeeded(CeedOperator op, bool needs_data_update);
+CEED_EXTERN int  CeedOperatorSetLinearElementAssembly(CeedOperator op, bool use_linear_element_assembly);
+CEED_EXTERN int  CeedOperatorGetLinearElementAssembly(CeedOperator op, bool *use_linear_element_assembly);
 CEED_EXTERN int  CeedOperatorLinearAssembleQFunction(CeedOperator op, CeedVector *assembled, CeedElemRestriction *rstr, CeedRequest *request);
 CEED_EXTERN int  CeedOperatorLinearAssembleQFunctionBuildOrUpdate(CeedOperator op, CeedVector *assembled, CeedElemRestriction *rstr,
                                                                   CeedRequest *request);

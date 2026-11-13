@@ -415,6 +415,7 @@ struct CeedOperator_private {
   int (*ApplyAddComposite)(CeedOperator, CeedVector, CeedVector, CeedRequest *);
   int (*ApplyJacobian)(CeedOperator, CeedVector, CeedVector, CeedVector, CeedVector, CeedRequest *);
   int (*SetEnableCudaGraph)(CeedOperator, bool);
+  int (*SetLinearElementAssembly)(CeedOperator, bool);
   int (*Destroy)(CeedOperator);
   CeedOperatorField        *input_fields;
   CeedOperatorField        *output_fields;
@@ -433,6 +434,7 @@ struct CeedOperator_private {
   bool                      is_at_points;
   bool                      has_restriction;
   bool                      is_sequential;
+  bool                      use_linear_element_assembly;
   CeedQFunctionAssemblyData qf_assembled;
   CeedOperatorAssemblyData  op_assembled;
   CeedOperator             *sub_operators;

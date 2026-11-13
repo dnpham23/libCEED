@@ -742,6 +742,14 @@ function CeedOperatorSetQFunctionAssemblyDataUpdateNeeded(op, needs_data_update)
     ccall((:CeedOperatorSetQFunctionAssemblyDataUpdateNeeded, libceed), Cint, (CeedOperator, Bool), op, needs_data_update)
 end
 
+function CeedOperatorSetLinearElementAssembly(op, use_linear_element_assembly)
+    ccall((:CeedOperatorSetLinearElementAssembly, libceed), Cint, (CeedOperator, Bool), op, use_linear_element_assembly)
+end
+
+function CeedOperatorGetLinearElementAssembly(op, use_linear_element_assembly)
+    ccall((:CeedOperatorGetLinearElementAssembly, libceed), Cint, (CeedOperator, Ptr{Bool}), op, use_linear_element_assembly)
+end
+
 function CeedOperatorLinearAssembleQFunction(op, assembled, rstr, request)
     ccall((:CeedOperatorLinearAssembleQFunction, libceed), Cint, (CeedOperator, Ptr{CeedVector}, Ptr{CeedElemRestriction}, Ptr{CeedRequest}), op, assembled, rstr, request)
 end

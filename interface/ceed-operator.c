@@ -565,6 +565,79 @@ static int CeedOperatorContextRestoreGenericRead(CeedOperator op, CeedContextFie
   return CEED_ERROR_SUCCESS;
 }
 
+/**
+  @brief Check that a non-composite `CeedOperator` can be applied with its element matrices, see @ref CeedOperatorSetLinearElementAssembly()
+
+  @param[in] op `CeedOperator` to check
+
+  @return An error code: 0 - success, otherwise - failure
+
+  @ref Developer
+**/
+static int CeedOperatorCheckLinearElementAssembly(CeedOperator op) {
+  bool                 is_at_points, is_context_writable = false, has_passive_output = false, has_multiple_active = false;
+  CeedInt              num_input_fields, num_output_fields;
+  CeedBasis            active_bases[2] = {NULL, NULL};
+  CeedElemRestriction  active_rstrs[2] = {NULL, NULL};
+  CeedQFunctionContext ctx;
+  CeedOperatorField   *input_fields, *output_fields;
+
+  CeedCall(CeedOperatorIsAtPoints(op, &is_at_points));
+  CeedCheck(!is_at_points, CeedOperatorReturnCeed(op), CEED_ERROR_UNSUPPORTED, "Linear element assembly is not supported for AtPoints operators");
+
+  // The context must not change during application
+  CeedCall(CeedOperatorGetContext(op, &ctx));
+  if (ctx) {
+    CeedQFunction qf;
+
+    CeedCall(CeedOperatorGetQFunction(op, &qf));
+    CeedCall(CeedQFunctionIsContextWritable(qf, &is_context_writable));
+    CeedCall(CeedQFunctionDestroy(&qf));
+    CeedCall(CeedQFunctionContextDestroy(&ctx));
+  }
+  CeedCheck(!is_context_writable, CeedOperatorReturnCeed(op), CEED_ERROR_INCOMPATIBLE,
+            "Linear element assembly requires a CeedQFunctionContext that is not writable, see CeedQFunctionSetContextWritable()");
+
+  // A single active input and output element restriction and basis, and no passive outputs
+  CeedCall(CeedOperatorGetFields(op, &num_input_fields, &input_fields, &num_output_fields, &output_fields));
+  for (CeedInt i = 0; i < num_input_fields + num_output_fields; i++) {
+    const bool          is_input = i < num_input_fields;
+    const CeedInt       side     = is_input ? 0 : 1;
+    CeedVector          vec;
+    CeedElemRestriction rstr;
+    CeedBasis           basis;
+
+    CeedCall(CeedOperatorFieldGetData(is_input ? input_fields[i] : output_fields[i - num_input_fields], NULL, &rstr, &basis, &vec));
+    if (vec == CEED_VECTOR_ACTIVE) {
+      if (!active_rstrs[side]) {
+        CeedCall(CeedElemRestrictionReferenceCopy(rstr, &active_rstrs[side]));
+        CeedCall(CeedBasisReferenceCopy(basis, &active_bases[side]));
+      }
+      has_multiple_active |= rstr != active_rstrs[side] || basis != active_bases[side];
+    } else if (!is_input) {
+      has_passive_output = true;
+    }
+    CeedCall(CeedVectorDestroy(&vec));
+    CeedCall(CeedElemRestrictionDestroy(&rstr));
+    CeedCall(CeedBasisDestroy(&basis));
+  }
+  const bool has_active_input_and_output = active_rstrs[0] && active_rstrs[1];
+
+  for (CeedInt side = 0; side < 2; side++) {
+    CeedCall(CeedElemRestrictionDestroy(&active_rstrs[side]));
+    CeedCall(CeedBasisDestroy(&active_bases[side]));
+  }
+  CeedCheck(!has_passive_output, CeedOperatorReturnCeed(op), CEED_ERROR_INCOMPATIBLE,
+            "Linear element assembly does not support passive output fields");
+  CeedCheck(!has_multiple_active, CeedOperatorReturnCeed(op), CEED_ERROR_INCOMPATIBLE,
+            "Linear element assembly requires a single active input and output CeedElemRestriction and CeedBasis");
+  CeedCheck(has_active_input_and_output, CeedOperatorReturnCeed(op), CEED_ERROR_INCOMPATIBLE,
+            "Linear element assembly requires active input and output fields");
+  CeedCheck(op->SetLinearElementAssembly, CeedOperatorReturnCeed(op), CEED_ERROR_UNSUPPORTED,
+            "Backend does not implement CeedOperatorSetLinearElementAssembly");
+  return CEED_ERROR_SUCCESS;
+}
+
 /// @}
 
 /// ----------------------------------------------------------------------------
@@ -1599,6 +1672,80 @@ int CeedOperatorSetQFunctionAssemblyDataUpdateNeeded(CeedOperator op, bool needs
 
     CeedCall(CeedOperatorGetQFunctionAssemblyData(op, &data));
     CeedCall(CeedQFunctionAssemblyDataSetUpdateNeeded(data, needs_data_update));
+  }
+  return CEED_ERROR_SUCCESS;
+}
+
+/**
+  @brief Set whether to apply a `CeedOperator` with its element matrices.
+
+  When `use_linear_element_assembly = true`, @ref CeedOperatorApply() and @ref CeedOperatorApplyAdd() use the element matrices of the `CeedOperator`, computed as for @ref CeedOperatorLinearAssemble(), instead of applying the `CeedBasis` and the `CeedQFunction`.
+  This is only valid for a `CeedOperator` that is linear in its active input, which is the responsibility of the caller.
+  The element matrices are computed at the next application, and again when a passive input `CeedVector` or the `CeedQFunctionContext` changes.
+  They take `num_elem * num_comp_in * num_comp_out * elem_size_in * elem_size_out` values, so this is typically only beneficial for small elements.
+
+  The `CeedOperator` must have all of its fields set, a single active input and output `CeedElemRestriction` and `CeedBasis`, no passive outputs, and a `CeedQFunctionContext` that is not writable, see @ref CeedQFunctionSetContextWritable(); `CeedOperator` at points are not supported.
+  For a composite `CeedOperator`, this is set on all of its sub-operators, which must all satisfy these conditions.
+
+  @param[in,out] op                          `CeedOperator`
+  @param[in]     use_linear_element_assembly Boolean flag to apply with the element matrices
+
+  @return An error code: 0 - success, otherwise - failure
+
+  @ref Advanced
+**/
+int CeedOperatorSetLinearElementAssembly(CeedOperator op, bool use_linear_element_assembly) {
+  bool is_composite;
+
+  CeedCall(CeedOperatorCheckReady(op));
+  CeedCall(CeedOperatorIsComposite(op, &is_composite));
+  if (is_composite) {
+    CeedInt       num_suboperators;
+    CeedOperator *sub_operators;
+
+    CeedCall(CeedOperatorCompositeGetNumSub(op, &num_suboperators));
+    CeedCall(CeedOperatorCompositeGetSubList(op, &sub_operators));
+    // Check all sub-operators before changing any
+    for (CeedInt i = 0; i < num_suboperators && use_linear_element_assembly; i++) {
+      CeedCall(CeedOperatorCheckLinearElementAssembly(sub_operators[i]));
+    }
+    for (CeedInt i = 0; i < num_suboperators; i++) {
+      CeedCall(CeedOperatorSetLinearElementAssembly(sub_operators[i], use_linear_element_assembly));
+    }
+  } else {
+    if (use_linear_element_assembly) CeedCall(CeedOperatorCheckLinearElementAssembly(op));
+    if (op->SetLinearElementAssembly) CeedCall(op->SetLinearElementAssembly(op, use_linear_element_assembly));
+    op->use_linear_element_assembly = use_linear_element_assembly;
+  }
+  return CEED_ERROR_SUCCESS;
+}
+
+/**
+  @brief Get whether a `CeedOperator` is applied with its element matrices, see @ref CeedOperatorSetLinearElementAssembly().
+
+  For a composite `CeedOperator`, this is whether all of its sub-operators are.
+
+  @param[in]  op                          `CeedOperator`
+  @param[out] use_linear_element_assembly Variable to store the flag
+
+  @return An error code: 0 - success, otherwise - failure
+
+  @ref Advanced
+**/
+int CeedOperatorGetLinearElementAssembly(CeedOperator op, bool *use_linear_element_assembly) {
+  bool is_composite;
+
+  CeedCall(CeedOperatorIsComposite(op, &is_composite));
+  if (is_composite) {
+    CeedInt       num_suboperators;
+    CeedOperator *sub_operators;
+
+    CeedCall(CeedOperatorCompositeGetNumSub(op, &num_suboperators));
+    CeedCall(CeedOperatorCompositeGetSubList(op, &sub_operators));
+    *use_linear_element_assembly = num_suboperators > 0;
+    for (CeedInt i = 0; i < num_suboperators; i++) *use_linear_element_assembly &= sub_operators[i]->use_linear_element_assembly;
+  } else {
+    *use_linear_element_assembly = op->use_linear_element_assembly;
   }
   return CEED_ERROR_SUCCESS;
 }
