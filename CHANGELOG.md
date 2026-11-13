@@ -8,6 +8,9 @@ On this page we provide a summary of the main API changes, new features and exam
 
 ### Interface changes
 
+- Add `CeedOperator[Set|Get]LinearElementAssembly()` to apply a linear `CeedOperator` with its element matrices, computed as for `CeedOperatorLinearAssemble()` and recomputed when passive inputs or the `CeedQFunctionContext` change.
+  Supported by the `/cpu/self/opt/*` backends and the backends that delegate to them, such as `/cpu/self/xsmm/*`.
+
 ### New features
 
 - Add `/gpu/cuda/cutlass` backend, which applies non-tensor bases (H1, H(div), and H(curl)) with CUTLASS CuTe GEMM kernels, JiT compiled for each basis, and delegates all other operations to `/gpu/cuda/shared`.

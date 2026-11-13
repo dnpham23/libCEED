@@ -20,6 +20,18 @@ typedef struct {
 } CeedBasis_Opt;
 
 typedef struct {
+  bool                is_setup, is_assembled;
+  CeedElemRestriction rstr_in, rstr_out; /* Active element restrictions */
+  bool                is_strided_in, is_strided_out;
+  CeedInt             l_layout_in[3], l_layout_out[3]; /* L-vector strides of nodes, components, elements; only components with offsets */
+  CeedInt             elem_size_in, elem_size_out, num_comp_in, num_comp_out;
+  CeedScalar         *values;        /* Element matrices with the orientations, rows and columns by component then node */
+  CeedScalar         *work;          /* Input and output of one element */
+  uint64_t           *input_states;  /* State counters of passive inputs at assembly */
+  uint64_t            context_state; /* State counter of context at assembly */
+} CeedElemMats_Opt;
+
+typedef struct {
   bool                 is_identity_qf, is_identity_rstr_op;
   bool                *skip_rstr_in, *skip_rstr_out, *apply_add_basis_out;
   CeedElemRestriction *block_rstr;   /* Blocked versions of restrictions */
@@ -33,6 +45,8 @@ typedef struct {
   CeedInt              qf_size_in, qf_size_out;
   CeedVector           qf_l_vec;
   CeedElemRestriction  qf_block_rstr;
+  bool                 use_elem_mats;
+  CeedElemMats_Opt     elem_mats;
 } CeedOperator_Opt;
 
 CEED_INTERN int CeedTensorContractCreate_Opt(CeedTensorContract contract);

@@ -382,6 +382,238 @@ static inline int CeedOperatorRestoreInputs_Opt(CeedInt num_input_fields, CeedQF
 }
 
 //------------------------------------------------------------------------------
+// Setup Application with Element Matrices
+//------------------------------------------------------------------------------
+static int CeedOperatorSetupElementMatrices_Opt(CeedOperator op, CeedElemMats_Opt *elem_mats) {
+  if (elem_mats->is_setup) return CEED_ERROR_SUCCESS;
+
+  // Active restrictions, see CeedOperatorSetLinearElementAssembly() for the single active restriction and basis
+  CeedCallBackend(CeedOperatorGetActiveElemRestrictions(op, &elem_mats->rstr_in, &elem_mats->rstr_out));
+  for (CeedInt side = 0; side < 2; side++) {
+    CeedElemRestriction rstr = side == 0 ? elem_mats->rstr_in : elem_mats->rstr_out;
+    CeedRestrictionType rstr_type;
+    bool               *is_strided = side == 0 ? &elem_mats->is_strided_in : &elem_mats->is_strided_out;
+    CeedInt            *l_layout   = side == 0 ? elem_mats->l_layout_in : elem_mats->l_layout_out;
+
+    CeedCallBackend(CeedElemRestrictionGetType(rstr, &rstr_type));
+    *is_strided = rstr_type == CEED_RESTRICTION_STRIDED;
+    if (*is_strided) {
+      CeedCallBackend(CeedElemRestrictionGetLLayout(rstr, l_layout));
+    } else {
+      CeedCallBackend(CeedElemRestrictionGetCompStride(rstr, &l_layout[1]));
+    }
+    CeedCallBackend(CeedElemRestrictionGetElementSize(rstr, side == 0 ? &elem_mats->elem_size_in : &elem_mats->elem_size_out));
+    CeedCallBackend(CeedElemRestrictionGetNumComponents(rstr, side == 0 ? &elem_mats->num_comp_in : &elem_mats->num_comp_out));
+  }
+  CeedCallBackend(CeedCalloc(elem_mats->elem_size_in * elem_mats->num_comp_in + elem_mats->elem_size_out * elem_mats->num_comp_out,
+                             &elem_mats->work));
+  CeedCallBackend(CeedCalloc(CEED_FIELD_MAX, &elem_mats->input_states));
+  elem_mats->is_setup = true;
+  return CEED_ERROR_SUCCESS;
+}
+
+//------------------------------------------------------------------------------
+// Assemble Element Matrices, if Passive Inputs or Context Changed
+//------------------------------------------------------------------------------
+static int CeedOperatorAssembleElementMatrices_Opt(CeedOperator op, CeedOperator_Opt *impl, CeedRequest *request) {
+  CeedElemMats_Opt    *elem_mats        = &impl->elem_mats;
+  bool                 is_update_needed = !elem_mats->is_assembled;
+  uint64_t             context_state    = 0;
+  CeedInt              num_input_fields;
+  CeedQFunctionContext ctx;
+  CeedOperatorField   *op_input_fields;
+
+  // Check states
+  CeedCallBackend(CeedOperatorGetFields(op, &num_input_fields, &op_input_fields, NULL, NULL));
+  for (CeedInt i = 0; i < num_input_fields; i++) {
+    CeedVector vec;
+
+    CeedCallBackend(CeedOperatorFieldGetVector(op_input_fields[i], &vec));
+    if (vec != CEED_VECTOR_ACTIVE && vec != CEED_VECTOR_NONE) {
+      uint64_t state;
+
+      CeedCallBackend(CeedVectorGetState(vec, &state));
+      is_update_needed |= state != elem_mats->input_states[i];
+    }
+    CeedCallBackend(CeedVectorDestroy(&vec));
+  }
+  CeedCallBackend(CeedOperatorGetContext(op, &ctx));
+  if (ctx) CeedCallBackend(CeedQFunctionContextGetState(ctx, &context_state));
+  CeedCallBackend(CeedQFunctionContextDestroy(&ctx));
+  is_update_needed |= context_state != elem_mats->context_state;
+  if (!is_update_needed) return CEED_ERROR_SUCCESS;
+
+  // Assemble QFunction and compute element matrices
+  {
+    CeedInt             layout_qf[3];
+    const CeedScalar   *assembled_qf_array;
+    CeedVector          assembled_qf   = NULL;
+    CeedElemRestriction assembled_rstr = NULL;
+
+    if (!elem_mats->values) {
+      CeedInt num_elem;
+
+      CeedCallBackend(CeedOperatorGetNumElements(op, &num_elem));
+      CeedCallBackend(CeedCalloc((CeedSize)num_elem * elem_mats->elem_size_in * elem_mats->num_comp_in * elem_mats->elem_size_out *
+                                     elem_mats->num_comp_out,
+                                 &elem_mats->values));
+    }
+    CeedCallBackend(CeedOperatorLinearAssembleQFunction(op, &assembled_qf, &assembled_rstr, request));
+    CeedCallBackend(CeedElemRestrictionGetELayout(assembled_rstr, layout_qf));
+    CeedCallBackend(CeedElemRestrictionDestroy(&assembled_rstr));
+    CeedCallBackend(CeedVectorGetArrayRead(assembled_qf, CEED_MEM_HOST, &assembled_qf_array));
+    CeedCallBackend(CeedOperatorAssembleElementMatrices(op, assembled_qf_array, layout_qf, 0, 0, elem_mats->values));
+    CeedCallBackend(CeedVectorRestoreArrayRead(assembled_qf, &assembled_qf_array));
+    CeedCallBackend(CeedVectorDestroy(&assembled_qf));
+  }
+
+  // With several components, order each element matrix by component then node, instead of by pair of components
+  if (elem_mats->num_comp_in > 1 || elem_mats->num_comp_out > 1) {
+    const CeedInt elem_size_in = elem_mats->elem_size_in, elem_size_out = elem_mats->elem_size_out;
+    const CeedInt num_comp_in = elem_mats->num_comp_in, num_comp_out = elem_mats->num_comp_out;
+    const CeedInt size_in = elem_size_in * num_comp_in, size_out = elem_size_out * num_comp_out;
+    CeedInt       num_elem;
+    CeedScalar   *blocks;
+
+    CeedCallBackend(CeedOperatorGetNumElements(op, &num_elem));
+    CeedCallBackend(CeedCalloc(size_in * size_out, &blocks));
+    for (CeedSize e = 0; e < num_elem; e++) {
+      CeedScalar *elem_mat = &elem_mats->values[e * size_in * size_out];
+
+      memcpy(blocks, elem_mat, size_in * size_out * sizeof(CeedScalar));
+      for (CeedInt comp_in = 0; comp_in < num_comp_in; comp_in++) {
+        for (CeedInt comp_out = 0; comp_out < num_comp_out; comp_out++) {
+          for (CeedInt i = 0; i < elem_size_out; i++) {
+            for (CeedInt j = 0; j < elem_size_in; j++) {
+              elem_mat[(comp_out * elem_size_out + i) * size_in + comp_in * elem_size_in + j] =
+                  blocks[((comp_in * num_comp_out + comp_out) * elem_size_out + i) * elem_size_in + j];
+            }
+          }
+        }
+      }
+    }
+    CeedCallBackend(CeedFree(&blocks));
+  }
+
+  // Record states, and release the E-vector copies of the passive inputs, which are restricted again if needed
+  for (CeedInt i = 0; i < num_input_fields; i++) {
+    CeedVector vec;
+
+    CeedCallBackend(CeedOperatorFieldGetVector(op_input_fields[i], &vec));
+    if (vec != CEED_VECTOR_ACTIVE && vec != CEED_VECTOR_NONE) {
+      CeedCallBackend(CeedVectorGetState(vec, &elem_mats->input_states[i]));
+      if (impl->e_vecs_full[i] && !impl->skip_rstr_in[i]) {
+        CeedCallBackend(CeedVectorSetArray(impl->e_vecs_full[i], CEED_MEM_HOST, CEED_OWN_POINTER, NULL));
+      }
+      impl->input_states[i] = 0;
+    }
+    CeedCallBackend(CeedVectorDestroy(&vec));
+  }
+  elem_mats->context_state = context_state;
+  elem_mats->is_assembled  = true;
+  return CEED_ERROR_SUCCESS;
+}
+
+//------------------------------------------------------------------------------
+// Operator Apply with Element Matrices
+//------------------------------------------------------------------------------
+static int CeedOperatorApplyAddElementMatrices_Opt(CeedOperator op, CeedVector in_vec, CeedVector out_vec, CeedRequest *request) {
+  CeedInt           num_elem;
+  const CeedInt    *offsets_in = NULL, *offsets_out = NULL;
+  const CeedScalar *x;
+  CeedScalar       *y;
+  CeedOperator_Opt *impl;
+  CeedElemMats_Opt *elem_mats;
+
+  CeedCallBackend(CeedOperatorGetData(op, &impl));
+  CeedCallBackend(CeedOperatorGetNumElements(op, &num_elem));
+  elem_mats = &impl->elem_mats;
+  CeedCallBackend(CeedOperatorSetupElementMatrices_Opt(op, elem_mats));
+  CeedCallBackend(CeedOperatorAssembleElementMatrices_Opt(op, impl, request));
+
+  const CeedInt  elem_size_in = elem_mats->elem_size_in, elem_size_out = elem_mats->elem_size_out;
+  const CeedInt  num_comp_in = elem_mats->num_comp_in, num_comp_out = elem_mats->num_comp_out;
+  const CeedInt  size_in = elem_size_in * num_comp_in, size_out = elem_size_out * num_comp_out;
+  const CeedInt *l_layout_in = elem_mats->l_layout_in, *l_layout_out = elem_mats->l_layout_out;
+  const CeedScalar *restrict values = elem_mats->values;
+  CeedScalar *restrict u = elem_mats->work, *restrict v = &elem_mats->work[size_in];
+
+  // The element matrices include the orientations of the restrictions, so they act on the L-vector values of each element
+  if (!elem_mats->is_strided_in) CeedCallBackend(CeedElemRestrictionGetOffsets(elem_mats->rstr_in, CEED_MEM_HOST, &offsets_in));
+  if (!elem_mats->is_strided_out) CeedCallBackend(CeedElemRestrictionGetOffsets(elem_mats->rstr_out, CEED_MEM_HOST, &offsets_out));
+  CeedCallBackend(CeedVectorGetArrayRead(in_vec, CEED_MEM_HOST, &x));
+  CeedCallBackend(CeedVectorGetArray(out_vec, CEED_MEM_HOST, &y));
+  if (offsets_in && offsets_out && num_comp_in == 1 && num_comp_out == 1) {
+    for (CeedSize e = 0; e < num_elem; e++) {
+      const CeedScalar *restrict elem_mat = &values[e * size_in * size_out];
+      const CeedInt *restrict indices_in = &offsets_in[e * elem_size_in], *restrict indices_out = &offsets_out[e * elem_size_out];
+
+      for (CeedInt j = 0; j < elem_size_in; j++) u[j] = x[indices_in[j]];
+      for (CeedInt i = 0; i < elem_size_out; i++) {
+        CeedScalar sum = 0.0;
+
+        for (CeedInt j = 0; j < elem_size_in; j++) sum += elem_mat[i * elem_size_in + j] * u[j];
+        y[indices_out[i]] += sum;
+      }
+    }
+  } else {
+    for (CeedSize e = 0; e < num_elem; e++) {
+      const CeedScalar *restrict elem_mat = &values[e * size_in * size_out];
+
+      for (CeedInt c = 0; c < num_comp_in; c++) {
+        for (CeedInt j = 0; j < elem_size_in; j++) {
+          u[c * elem_size_in + j] = x[offsets_in ? offsets_in[e * elem_size_in + j] + (CeedSize)c * l_layout_in[1]
+                                                 : j * l_layout_in[0] + (CeedSize)c * l_layout_in[1] + e * l_layout_in[2]];
+        }
+      }
+      for (CeedInt i = 0; i < size_out; i++) {
+        CeedScalar sum = 0.0;
+
+        for (CeedInt j = 0; j < size_in; j++) sum += elem_mat[i * size_in + j] * u[j];
+        v[i] = sum;
+      }
+      for (CeedInt c = 0; c < num_comp_out; c++) {
+        for (CeedInt i = 0; i < elem_size_out; i++) {
+          y[offsets_out ? offsets_out[e * elem_size_out + i] + (CeedSize)c * l_layout_out[1]
+                        : i * l_layout_out[0] + (CeedSize)c * l_layout_out[1] + e * l_layout_out[2]] += v[c * elem_size_out + i];
+        }
+      }
+    }
+  }
+  CeedCallBackend(CeedVectorRestoreArrayRead(in_vec, &x));
+  CeedCallBackend(CeedVectorRestoreArray(out_vec, &y));
+  if (offsets_in) CeedCallBackend(CeedElemRestrictionRestoreOffsets(elem_mats->rstr_in, &offsets_in));
+  if (offsets_out) CeedCallBackend(CeedElemRestrictionRestoreOffsets(elem_mats->rstr_out, &offsets_out));
+  return CEED_ERROR_SUCCESS;
+}
+
+//------------------------------------------------------------------------------
+// Set Application with Element Matrices
+//------------------------------------------------------------------------------
+static int CeedOperatorSetLinearElementAssembly_Opt(CeedOperator op, bool use_linear_element_assembly) {
+  CeedOperator_Opt *impl;
+
+  CeedCallBackend(CeedOperatorGetData(op, &impl));
+  if (use_linear_element_assembly) {
+    // The element values are gathered and scattered with the offsets of unblocked element restrictions
+    CeedInt             block_size_in, block_size_out;
+    CeedElemRestriction rstr_in, rstr_out;
+
+    CeedCallBackend(CeedOperatorGetActiveElemRestrictions(op, &rstr_in, &rstr_out));
+    CeedCallBackend(CeedElemRestrictionGetBlockSize(rstr_in, &block_size_in));
+    CeedCallBackend(CeedElemRestrictionGetBlockSize(rstr_out, &block_size_out));
+    CeedCallBackend(CeedElemRestrictionDestroy(&rstr_in));
+    CeedCallBackend(CeedElemRestrictionDestroy(&rstr_out));
+    CeedCheck(block_size_in == 1 && block_size_out == 1, CeedOperatorReturnCeed(op), CEED_ERROR_UNSUPPORTED,
+              "Linear element assembly does not support blocked element restrictions");
+  }
+  impl->use_elem_mats          = use_linear_element_assembly;
+  impl->elem_mats.is_assembled = false;
+  if (!use_linear_element_assembly) CeedCallBackend(CeedFree(&impl->elem_mats.values));
+  return CEED_ERROR_SUCCESS;
+}
+
+//------------------------------------------------------------------------------
 // Operator Apply
 //------------------------------------------------------------------------------
 static int CeedOperatorApplyAdd_Opt(CeedOperator op, CeedVector in_vec, CeedVector out_vec, CeedRequest *request) {
@@ -412,6 +644,12 @@ static int CeedOperatorApplyAdd_Opt(CeedOperator op, CeedVector in_vec, CeedVect
       CeedCallBackend(CeedElemRestrictionApplyBlock(impl->block_rstr[0], b, CEED_NOTRANSPOSE, in_vec, impl->e_vecs_in[0], request));
       CeedCallBackend(CeedElemRestrictionApplyBlock(impl->block_rstr[1], b, CEED_TRANSPOSE, impl->e_vecs_in[0], out_vec, request));
     }
+    return CEED_ERROR_SUCCESS;
+  }
+
+  // Element matrices
+  if (impl->use_elem_mats) {
+    CeedCallBackend(CeedOperatorApplyAddElementMatrices_Opt(op, in_vec, out_vec, request));
     return CEED_ERROR_SUCCESS;
   }
 
@@ -733,6 +971,13 @@ static int CeedOperatorDestroy_Opt(CeedOperator op) {
   CeedCallBackend(CeedVectorDestroy(&impl->qf_l_vec));
   CeedCallBackend(CeedElemRestrictionDestroy(&impl->qf_block_rstr));
 
+  // Element matrices
+  CeedCallBackend(CeedElemRestrictionDestroy(&impl->elem_mats.rstr_in));
+  CeedCallBackend(CeedElemRestrictionDestroy(&impl->elem_mats.rstr_out));
+  CeedCallBackend(CeedFree(&impl->elem_mats.values));
+  CeedCallBackend(CeedFree(&impl->elem_mats.work));
+  CeedCallBackend(CeedFree(&impl->elem_mats.input_states));
+
   CeedCallBackend(CeedFree(&impl));
   return CEED_ERROR_SUCCESS;
 }
@@ -757,6 +1002,7 @@ int CeedOperatorCreate_Opt(CeedOperator op) {
   CeedCallBackend(CeedSetBackendFunction(ceed, "Operator", op, "LinearAssembleQFunction", CeedOperatorLinearAssembleQFunction_Opt));
   CeedCallBackend(CeedSetBackendFunction(ceed, "Operator", op, "LinearAssembleQFunctionUpdate", CeedOperatorLinearAssembleQFunctionUpdate_Opt));
   CeedCallBackend(CeedSetBackendFunction(ceed, "Operator", op, "ApplyAdd", CeedOperatorApplyAdd_Opt));
+  CeedCallBackend(CeedSetBackendFunction(ceed, "Operator", op, "SetLinearElementAssembly", CeedOperatorSetLinearElementAssembly_Opt));
   CeedCallBackend(CeedSetBackendFunction(ceed, "Operator", op, "Destroy", CeedOperatorDestroy_Opt));
   CeedCallBackend(CeedDestroy(&ceed));
   return CEED_ERROR_SUCCESS;
