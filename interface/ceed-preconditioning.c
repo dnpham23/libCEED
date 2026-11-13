@@ -888,6 +888,35 @@ int CeedOperatorAssembleSingleBlock(CeedOperator op, CeedInt offset, CeedInt act
   CeedCall(CeedElemRestrictionDestroy(&assembled_elem_rstr));
   CeedCall(CeedVectorGetArrayRead(assembled_qf, CEED_MEM_HOST, &assembled_qf_array));
 
+  // Compute element matrices
+  CeedScalar *vals;
+
+  CeedCall(CeedVectorGetArray(values, CEED_MEM_HOST, &vals));
+  CeedCall(CeedOperatorAssembleElementMatrices(op, assembled_qf_array, layout_qf, active_input, active_output, &vals[offset]));
+  CeedCall(CeedVectorRestoreArray(values, &vals));
+  CeedCall(CeedVectorRestoreArrayRead(assembled_qf, &assembled_qf_array));
+  CeedCall(CeedVectorDestroy(&assembled_qf));
+  return CEED_ERROR_SUCCESS;
+}
+
+/**
+  @brief Compute the element matrices of a non-composite `CeedOperator` for a pair of active input and output bases.
+
+  The element matrices include the orientations of the element restrictions and are stored in the order of the corresponding nonzero entries of @ref CeedOperatorLinearAssemble(): by element, then input component, then output component, each as a row-major `elem_size_out x elem_size_in` matrix.
+
+  @param[in]  op            `CeedOperator` to assemble
+  @param[in]  assembled_qf  Assembled `CeedQFunction` values, see @ref CeedOperatorLinearAssembleQFunction()
+  @param[in]  layout_qf     E-vector layout of `assembled_qf`, see @ref CeedElemRestrictionGetELayout()
+  @param[in]  active_input  Index of active input basis
+  @param[in]  active_output Index of active output basis
+  @param[out] values        Array of `num_elem * num_comp_in * num_comp_out * elem_size_out * elem_size_in` values
+
+  @return An error code: 0 - success, otherwise - failure
+
+  @ref Developer
+**/
+int CeedOperatorAssembleElementMatrices(CeedOperator op, const CeedScalar *assembled_qf, const CeedInt layout_qf[3], CeedInt active_input,
+                                        CeedInt active_output, CeedScalar *values) {
   // Get assembly data
   CeedSize                 local_num_entries, count = 0;
   CeedInt                  num_active_bases_in, *num_eval_modes_in, num_active_bases_out, *num_eval_modes_out;
@@ -972,14 +1001,13 @@ int CeedOperatorAssembleSingleBlock(CeedOperator op, CeedInt offset, CeedInt act
     // Loop over elements and put in data structure
     // We store B_mat_in, B_mat_out, BTD, elem_mat in row-major order
     CeedTensorContract contract;
-    CeedScalar        *vals, *BTD_mat = NULL, *elem_mat = NULL, *elem_mat_b = NULL;
+    CeedScalar        *BTD_mat = NULL, *elem_mat = NULL, *elem_mat_b = NULL;
 
     CeedCall(CeedBasisGetTensorContract(basis_in, &contract));
     CeedCall(CeedCalloc(elem_size_out * num_qpts_in * num_eval_modes_in[active_input], &BTD_mat));
     CeedCall(CeedCalloc(elem_size_out * elem_size_in, &elem_mat));
     if (elem_rstr_curl_orients_in || elem_rstr_curl_orients_out) CeedCall(CeedCalloc(elem_size_out * elem_size_in, &elem_mat_b));
 
-    CeedCall(CeedVectorGetArray(values, CEED_MEM_HOST, &vals));
     for (CeedSize e = 0; e < num_elem_in; e++) {
       for (CeedInt comp_in = 0; comp_in < num_comp_in; comp_in++) {
         for (CeedInt comp_out = 0; comp_out < num_comp_out; comp_out++) {
@@ -996,7 +1024,7 @@ int CeedOperatorAssembleSingleBlock(CeedOperator op, CeedInt offset, CeedInt act
                   const CeedSize eval_mode_index = row_offset * num_output_components + eval_modes_offsets_out[active_output][e_out] + comp_out;
                   const CeedSize qf_index        = q * layout_qf[0] + eval_mode_index * layout_qf[1] + e * layout_qf[2];
 
-                  sum += B_mat_out[b_out_index] * assembled_qf_array[qf_index];
+                  sum += B_mat_out[b_out_index] * assembled_qf[qf_index];
                 }
                 BTD_mat[btd_index] = sum;
               }
@@ -1066,7 +1094,7 @@ int CeedOperatorAssembleSingleBlock(CeedOperator op, CeedInt offset, CeedInt act
           // Put element matrix in coordinate data structure
           for (CeedInt i = 0; i < elem_size_out; i++) {
             for (CeedInt j = 0; j < elem_size_in; j++) {
-              vals[offset + count] = elem_mat[i * elem_size_in + j];
+              values[count] = elem_mat[i * elem_size_in + j];
               count++;
             }
           }
@@ -1074,7 +1102,6 @@ int CeedOperatorAssembleSingleBlock(CeedOperator op, CeedInt offset, CeedInt act
       }
     }
     CeedCheck(count == local_num_entries, CeedOperatorReturnCeed(op), CEED_ERROR_MAJOR, "Error computing entries");
-    CeedCall(CeedVectorRestoreArray(values, &vals));
 
     // Cleanup
     CeedCall(CeedFree(&BTD_mat));
@@ -1093,8 +1120,6 @@ int CeedOperatorAssembleSingleBlock(CeedOperator op, CeedInt offset, CeedInt act
       }
     }
   }
-  CeedCall(CeedVectorRestoreArrayRead(assembled_qf, &assembled_qf_array));
-  CeedCall(CeedVectorDestroy(&assembled_qf));
   return CEED_ERROR_SUCCESS;
 }
 
