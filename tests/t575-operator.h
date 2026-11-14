@@ -8,7 +8,7 @@
 #include <ceed/types.h>
 
 typedef struct {
-  CeedScalar scale;
+  double scale;
 } ScaleContext;
 
 CEED_QFUNCTION(setup)(void *ctx, const CeedInt Q, const CeedScalar *const *in, CeedScalar *const *out) {
